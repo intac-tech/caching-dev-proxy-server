@@ -1,11 +1,11 @@
 package tech.intac.devtools.cachingproxy;
 
 import java.io.ByteArrayInputStream;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.URI;
 import java.net.URL;
@@ -14,8 +14,6 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Date;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.Properties;
 
 import javax.servlet.ServletException;
@@ -29,9 +27,6 @@ import static java.net.http.HttpRequest.BodyPublishers;
 import static java.net.http.HttpRequest.newBuilder;
 
 public class ProxyServlet extends HttpServlet {
-
-    private final Map<String, String> cachedResponses = new HashMap<>();
-    private final Map<String, Properties> cachedHeaders = new HashMap<>();
 
     @Override
     protected void service(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
@@ -69,14 +64,6 @@ public class ProxyServlet extends HttpServlet {
             reqCacheAbsoluteFolder.toFile().mkdirs();
         }
 
-        // check from in-memory cache
-        String inMemCacheId = reqCacheAbsoluteFolder.toString();
-        if (cachedResponses.containsKey(inMemCacheId)) {
-            cachedHeaders.get(inMemCacheId).forEach((k, v) -> response.setHeader(k.toString(), v.toString()));
-            response.getWriter().println(cachedResponses.get(inMemCacheId));
-            return;
-        }
-
         var cachedRespHeadersPath = reqCacheAbsoluteFolder.resolve("response_headers");
         var cachedRespContentPath = reqCacheAbsoluteFolder.resolve("response_body");
         var cachedRespHeaders = new Properties();
@@ -89,6 +76,7 @@ public class ProxyServlet extends HttpServlet {
                 }
             }
             if (Files.exists(cachedRespContentPath)) {
+                response.setHeader("Content-Length", String.valueOf(Files.size(cachedRespContentPath)));
                 Files.copy(cachedRespContentPath, response.getOutputStream());
                 return; // end response
             }
@@ -100,24 +88,23 @@ public class ProxyServlet extends HttpServlet {
                     .forEach((k, v) -> cachedRespHeaders.put(k, v.size() > 0 ? v.get(0) : ""));
 
             // cache the response headers
-            try (OutputStream os = new FileOutputStream(cachedRespHeadersPath.toFile())) {
+            try (var os = new FileOutputStream(cachedRespHeadersPath.toFile())) {
                 cachedRespHeaders.store(os, "cached headers @ " + new Date());
-                cachedHeaders.put(inMemCacheId, cachedRespHeaders);
-            }
-
-            // cache the response
-            try (OutputStream os = new FileOutputStream(cachedRespContentPath.toFile())) {
-                IOUtils.copyLarge(remoteResponse.body(), os);
-            }
-
-            // send the file to the http request
-            try (InputStream is = new FileInputStream(cachedRespContentPath.toFile())) {
-                IOUtils.copyLarge(is, response.getOutputStream());
             }
 
             // cache the response in memory
-            String content = Files.readString(cachedRespContentPath);
-            cachedResponses.put(inMemCacheId, content);
+            var respBody = String.join("\n", IOUtils.readLines(new InputStreamReader(remoteResponse.body())));
+            respBody = respBody.replace(config.getBaseUrl(), "http://localhost:8090");
+            var respBodyInBytes = respBody.getBytes(StandardCharsets.UTF_8);
+
+            // cache the response
+            try (var os = new FileOutputStream(cachedRespContentPath.toFile())) {
+                IOUtils.copyLarge(new ByteArrayInputStream(respBodyInBytes), os);
+            }
+
+            // send the file to the http request
+            response.setHeader("Content-Length", String.valueOf(Files.size(cachedRespContentPath)));
+            IOUtils.copyLarge(new ByteArrayInputStream(respBodyInBytes), response.getOutputStream());
 
             // store the request details
             var cachedReqHeadersPath = reqCacheAbsoluteFolder.resolve("request_headers");
@@ -130,7 +117,7 @@ public class ProxyServlet extends HttpServlet {
                         cachedReqHeaders.setProperty(headerName, value);
                     });
 
-            try (OutputStream os = new FileOutputStream(cachedReqHeadersPath.toFile())) {
+            try (var os = new FileOutputStream(cachedReqHeadersPath.toFile())) {
                 cachedReqHeaders.store(os, "cached headers @ " + new Date());
             }
 
